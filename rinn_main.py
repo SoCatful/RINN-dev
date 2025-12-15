@@ -57,10 +57,12 @@ print("===== 阶段一：前期准备 =====")
 # 配置参数
 batch_size = 64  # 增大批次大小以加速训练
 epochs = 200  # 增加训练轮数以充分训练模型
-lr = 1.5e-3
+lr = 1.0e-3  # 降低学习率以稳定训练
+weight_decay = 1e-5  # 添加权重衰减防止过拟合----
 w_x = 1.0  # 调整权重系数使其接近
 w_y = 2.0  # 调整权重系数使其接近
 w_z = 1.0  # 调整权重系数使其接近
+clip_value = 1.0  # 梯度裁剪阈值----
 x_dim = 3
 z_dim = 3
 y_dim = 6
@@ -73,8 +75,8 @@ print(f"使用设备: {device}")
 # 初始化模型
 model = RINNModel(
     input_dim=model_input_dim,
-    hidden_dim=5,
-    num_blocks=4,
+    hidden_dim=15,
+    num_blocks=8,
     num_stages=1,
     num_cycles_per_stage=1
 ).to(device)
@@ -82,7 +84,7 @@ model = RINNModel(
 print(f"模型已创建，输入输出维度: {model.input_dim}")
 
 # 初始化优化器
-optimizer = optim.Adam(model.parameters(), lr=lr)
+optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)  # 添加权重衰减------
 
 
 # 阶段二：数据生成与预处理
@@ -217,6 +219,8 @@ for epoch in range(epochs):
         # 梯度更新
         optimizer.zero_grad()
         losses["total_loss"].backward()
+        # 梯度裁剪，防止梯度爆炸导致loss波动-----
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_value)
         optimizer.step()
         
         # 损失累加

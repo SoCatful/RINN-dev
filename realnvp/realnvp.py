@@ -240,12 +240,12 @@ class FlowStage(nn.Module):
         
         # 创建内部循环的FlowCell列表
         self.cells = nn.ModuleList([
-            FlowCell(self.h_prime_dim, x1_dim, hidden_dim) for _ in range(num_cycles)
+            FlowCell(self.input_dim, x1_dim, hidden_dim) for _ in range(num_cycles)
         ])
     
     def forward(self, x):
         """
-        FlowStage前向变换 - 先拆分再循环
+        FlowStage前向变换 - 先循环再拆分
         输入:
             x: 输入张量，形状(batch_size, input_dim)
         输出:
@@ -257,21 +257,21 @@ class FlowStage(nn.Module):
         if x.shape[1] != self.input_dim:
             raise ValueError(f"FlowStage期望输入维度 {self.input_dim}，但得到 {x.shape[1]}")
             
-        # 拆分：前z_part_dim部分作为当前层输出z，后h_prime_dim部分作为内部循环输入h'
+        # 对整个输入x执行num_cycles次内部循环
+        log_det_total = 0
+        for cell in self.cells:
+            x, log_det = cell(x)
+            log_det_total += log_det
+        
+        # 拆分：前z_part_dim部分作为当前层输出z，后h_prime_dim部分作为内部循环输出h'
         z_part = x[:, :self.z_part_dim]
         h_prime = x[:, self.z_part_dim:]
-        
-        # 对h'执行num_cycles次内部循环
-        log_det_total = 0
-        for cell in self.cells: #这块貌似不对吧——————————————！！！——————————————————————————————
-            h_prime, log_det = cell(h_prime)
-            log_det_total += log_det
         
         return z_part, h_prime, log_det_total
     
     def inverse(self, z_part, h_prime):
         """
-        FlowStage逆向变换 - 先逆循环再合并
+        FlowStage逆向变换 - 先合并再循环
         输入:
             z_part: 当前层输入z，形状(batch_size, z_part_dim)
             h_prime: 内部循环输入，形状(batch_size, h_prime_dim)
@@ -285,14 +285,14 @@ class FlowStage(nn.Module):
         if h_prime.shape[1] != self.h_prime_dim:
             raise ValueError(f"FlowStage逆变换期望h_prime维度 {self.h_prime_dim}，但得到 {h_prime.shape[1]}")
             
-        # 对h_prime逆序执行num_cycles次内部循环
+        # 合并z_part和h_prime
+        x = torch.cat([z_part, h_prime], dim=-1)
+        
+        # 对合并后的x逆序执行num_cycles次内部循环
         log_det_total = 0
         for cell in reversed(self.cells):
-            h_prime, log_det = cell.inverse(h_prime)
+            x, log_det = cell.inverse(x)
             log_det_total += log_det
-        
-        # 合并z_part和处理后的h_prime
-        x = torch.cat([z_part, h_prime], dim=-1)
         
         return x, log_det_total
 
@@ -329,6 +329,9 @@ class RealNVP(nn.Module):
         
         # 创建流动阶段列表
         self.stages = nn.ModuleList()
+        
+        # 创建用于残差链接融合的MLP层列表
+        self.fusion_mlps = nn.ModuleList()
         
         # 预计算并存储每个阶段的维度信息，用于前向和逆向变换
         self.stage_input_dims = []     # 每个FlowStage的输入维度
@@ -382,6 +385,17 @@ class RealNVP(nn.Module):
                 num_cycles_per_stage
             ))
             
+            # 创建仿射变换融合的MLP：将z_part映射到2倍h_prime的维度，分别作为scale和shift
+            fusion_mlp = nn.Sequential(
+                nn.Linear(z_part_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 2 * h_prime_dim),
+                nn.Tanh()  # 添加Tanh限制scale范围，确保数值稳定性
+            )
+            self.fusion_mlps.append(fusion_mlp)
+            
             # 更新当前维度（为下一个阶段准备）
             current_dim = h_prime_dim
     
@@ -429,12 +443,29 @@ class RealNVP(nn.Module):
             if current_h.shape[1] != self.stage_input_dims[i]:
                 raise ValueError(f"阶段 {i+1} 期望输入维度 {self.stage_input_dims[i]}，但得到 {current_h.shape[1]}")
             
-            # 执行当前阶段的前向变换（先拆分再循环）
-            z_part, current_h, log_det = stage(current_h)
+            # 执行当前阶段的前向变换（先循环再拆分）
+            z_part, h_prime, log_det = stage(current_h)
             log_det_total += log_det
             
             # 添加当前阶段的输出z
             z_list.append(z_part)
+            
+            # 仿射变换融合：将z_part通过MLP映射生成scale和shift参数
+            scale_shift = self.fusion_mlps[i](z_part)
+            
+            # 分割scale和shift
+            scale = scale_shift[:, :h_prime.shape[1]]
+            shift = scale_shift[:, h_prime.shape[1]:]
+            
+            # scale已经在fusion_mlp中通过Tanh限制在[-1, 1]范围，确保数值稳定性
+            scale = scale * 0.5  # 进一步缩小scale范围到[-0.5, 0.5]，使exp(scale)更接近1
+            
+            # 应用仿射变换
+            current_h = h_prime * torch.exp(scale) + shift  # 使用exp确保scale为正
+            
+            # 计算仿射变换的log雅可比矩阵：由于是元素级变换，雅可比矩阵是对角矩阵
+            # 对角线元素为exp(scale)，因此log_det是scale的和
+            log_det_total += scale.sum(dim=1)
         
         # 添加最后剩余的特征作为最终的z
         z_list.append(current_h)
@@ -489,9 +520,27 @@ class RealNVP(nn.Module):
             stage = self.stages[i]
             z_part = z_list.pop()
             
-            # 执行当前阶段的逆变换（先逆循环再合并）
-            current_h, log_det = stage.inverse(z_part, current_h)
-            log_det_total += log_det
+            # 仿射变换融合的逆操作
+            # 首先生成与前向相同的scale和shift参数
+            scale_shift = self.fusion_mlps[i](z_part)
+            scale = scale_shift[:, :current_h.shape[1]]
+            shift = scale_shift[:, current_h.shape[1]:]
+            
+            # scale已经在fusion_mlp中通过Tanh限制在[-1, 1]范围，确保数值稳定性
+            scale = scale * 0.5  # 进一步缩小scale范围到[-0.5, 0.5]
+            
+            # 应用逆仿射变换：(current_h - shift) / exp(scale)
+            h_prime = (current_h - shift) * torch.exp(-scale)
+            
+            # 计算逆仿射变换的log雅可比矩阵：由于逆变换的雅可比矩阵是原变换雅可比矩阵的逆
+            # 对角线元素为exp(-scale)，因此log_det是-scale的和
+            log_det_affine = (-scale).sum(dim=1)
+            
+            # 调用FlowStage的inverse方法，注意顺序是z_part在前，h_prime在后
+            current_h, log_det_stage = self.stages[i].inverse(z_part, h_prime)
+            
+            # 累加log_det
+            log_det_total += log_det_affine + log_det_stage
         
         # 确保最终输出维度与原始输入维度匹配
         if current_h.shape[1] > self.input_dim:
