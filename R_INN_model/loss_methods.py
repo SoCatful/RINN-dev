@@ -97,7 +97,7 @@ def mmd_loss(dist1: torch.Tensor, dist2: torch.Tensor, sigma: Optional[float] = 
     
     return mmd
 
-def nmse_loss(y_real: torch.Tensor, y_pred: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+def nmse_loss(y_real: torch.Tensor, y_pred: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
     """
     用于Ly的正向预测NMSE损失计算
     计算预测性能值与真实性能值之间的归一化均方误差，匹配论文中L3的定义
@@ -105,7 +105,7 @@ def nmse_loss(y_real: torch.Tensor, y_pred: torch.Tensor, eps: float = 1e-8) -> 
     参数:
         y_real: torch.Tensor - 真实性能值张量，形状为(batch_size, y_dim)
         y_pred: torch.Tensor - 预测性能值张量，形状必须与y_real相同
-        eps: float - 数值稳定项，默认1e-8，避免分母为零
+        eps: float - 数值稳定项，默认1e-4，避免分母为零
     
     返回:
         torch.Tensor - 标量张量，表示NMSE损失值，支持反向传播
@@ -114,14 +114,14 @@ def nmse_loss(y_real: torch.Tensor, y_pred: torch.Tensor, eps: float = 1e-8) -> 
     if y_real.shape != y_pred.shape:
         raise ValueError(f"y_real和y_pred的形状必须一致，得到y_real形状: {y_real.shape}，y_pred形状: {y_pred.shape}")
     
-    # 计算基础MSE（均方误差）
+    # 计算基础MSE（均一误差）
     mse = torch.mean((y_real - y_pred) ** 2)
     
-    # 计算真实值能量（平方均值）作为归一化基准
-    real_energy = torch.mean(y_real ** 2)
+    # 使用RMS（均方根）作为归一化基准，更稳定
+    real_rms = torch.sqrt(torch.mean(y_real ** 2) + eps)
     
-    # 计算NMSE，添加eps确保数值稳定性
-    nmse = mse / (real_energy + eps)
+    # 计算NMSE，使用RMS进行归一化
+    nmse = mse / (real_rms ** 2 + eps)
     
     return nmse
 

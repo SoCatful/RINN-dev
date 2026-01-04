@@ -62,11 +62,11 @@ class RINNBlock(nn.Module):
         # ActNorm 变换
         x = self.actnorm(x)
         
-        # RealNVP 变换
-        z, log_det_realnvp = self.realnvp(x)
+        # RealNVP 变换 - 保存这个输出用于z_loss计算
+        z_from_realnvp, log_det_realnvp = self.realnvp(x)
         
         # JL 层变换
-        z = self.jl_layer(z)
+        z = self.jl_layer(z_from_realnvp)
         
         # 计算 JL 层的雅可比行列式
         log_det_jl = self.jl_layer.log_det_jacobian(z)
@@ -78,6 +78,36 @@ class RINNBlock(nn.Module):
         log_det_total = log_det_realnvp + log_det_jl + log_det_actnorm
         
         return z, log_det_total
+    
+    def forward_with_intermediate(self, x):
+        """
+        RINNBlock 前向变换（带中间结果）
+        输入:
+            x: 输入张量，形状(batch_size, input_dim)
+        输出:
+            z: 变换后张量，形状(batch_size, input_dim)
+            log_det: 雅可比行列式的对数总和，形状(batch_size,)
+            z_from_realnvp: RealNVP层的输出（用于z_loss计算）
+        """
+        # ActNorm 变换
+        x = self.actnorm(x)
+        
+        # RealNVP 变换 - 保存这个输出用于z_loss计算
+        z_from_realnvp, log_det_realnvp = self.realnvp(x)
+        
+        # JL 层变换
+        z = self.jl_layer(z_from_realnvp)
+        
+        # 计算 JL 层的雅可比行列式
+        log_det_jl = self.jl_layer.log_det_jacobian(z)
+        
+        # 计算 ActNorm 层的雅可比行列式
+        log_det_actnorm = self.actnorm.log_det_jacobian(x)
+        
+        # 总和所有雅可比行列式的对数
+        log_det_total = log_det_realnvp + log_det_jl + log_det_actnorm
+        
+        return z, log_det_total, z_from_realnvp
     
     def inverse(self, z):
         """
@@ -214,14 +244,16 @@ class RINNModel(nn.Module):
         # 初始化FinalFeatureAdjustment层作为模型的最后一层
         self.feature_adjustment = FinalFeatureAdjustment(input_dim=input_dim)
     
-    def forward(self, x):
+    def forward(self, x, return_intermediate=False):
         """
         RINNModel 前向变换
         输入:
             x: 输入张量，形状(batch_size, input_dim)
+            return_intermediate: 是否返回中间结果（RealNVP的z输出）
         输出:
             z: 变换后张量，形状(batch_size, input_dim)
             log_det_total: 雅可比行列式的对数总和，形状(batch_size,)
+            (可选) z_from_realnvp: RealNVP层输出的z（用于z_loss计算）
         """
         # 检查输入维度
         if x.shape[1] != self.input_dim:
@@ -231,10 +263,18 @@ class RINNModel(nn.Module):
         z = x
         log_det_total = 0
         
+        # 存储RealNVP的输出z（用于z_loss计算）
+        z_from_realnvp = None
+        
         # 顺序通过每个组件（RINNBlock和Shuffle层交替）
-        for component in self.components:
-            z, log_det = component(z)
-            log_det_total += log_det
+        for i, component in enumerate(self.components):
+            if i == 0 and return_intermediate and hasattr(component, 'forward_with_intermediate'):
+                # 使用带中间结果的forward方法
+                z, log_det, z_from_realnvp = component.forward_with_intermediate(z)
+                log_det_total += log_det
+            else:
+                z, log_det = component(z)
+                log_det_total += log_det
 
         # 应用FinalFeatureAdjustment层进行特征精细化调整
         z = self.feature_adjustment(z)
@@ -242,7 +282,10 @@ class RINNModel(nn.Module):
         log_det_adjustment = self.feature_adjustment.log_det_jacobian(z)
         log_det_total += log_det_adjustment
 
-        return z, log_det_total
+        if return_intermediate:
+            return z, log_det_total, z_from_realnvp
+        else:
+            return z, log_det_total
     
     def inverse(self, z):
         """
